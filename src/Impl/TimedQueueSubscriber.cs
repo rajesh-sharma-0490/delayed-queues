@@ -11,58 +11,72 @@ namespace DelayedQueues.Impl
         private ITimedQueueProvider queueProvider;
         private Func<T, Task> callback;
         private bool isDisposed = false;
-        private int maxConcurrency;
+        private int availableSlots;
         private string queueName;
+
+        private List<Task> itemsInExecution = new List<Task>();
         public TimedQueueSubscriber(ITimedQueueProvider timedQueueProvider, string queueName, Func<T, Task> callback, int maxConcurrency = 10)
         {
             this.queueProvider = timedQueueProvider;
             this.callback = callback;
-            this.maxConcurrency = maxConcurrency;
+            this.availableSlots = maxConcurrency;
             this.queueName = queueName;
 
-            this.setupSubscription();
+            Task.Run(() => this.processItemsAsync());
         }
 
-        private void setupSubscription(){
-            Func<Task> waitForNextTurn = null, processItemStream = null;
-            
-            processItemStream = async() => {
-                while(true){
-                    var items = await this.queueProvider.dequeueAvailableItemsAsync<T>(this.queueName, this.maxConcurrency);
 
-                    if(this.isDisposed)
-                        return;
+        private async Task<IList<T>> getMoreItemsAsync(){
+            while(true){
+                var items = await this.queueProvider.dequeueAvailableItemsAsync<T>(this.queueName, this.availableSlots);
 
-                    items = items ?? new List<T>();
-                    if(items.Count == 0){
-                        await waitForNextTurn();
-                        continue;
-                    }
-                    
-                    var tasks = items.Select(x => this.callback(x));
+                items = items ?? new List<T>();
 
-                    await Task.WhenAll(tasks);
+                if(items.Count > 0)
+                    return items;
+
+                await this.waitForNextTurnAsync();
+            }
+        }
+
+        private async Task waitForNextTurnAsync(){
+            var timestamp = await this.queueProvider.getNextItemTimestampAsync(this.queueName);
+
+            TimeSpan delay;
+            if(timestamp != null && timestamp.HasValue)
+                delay = timestamp.Value.ToUniversalTime() - DateTime.Now.ToUniversalTime();
+            else
+                delay = TimeSpan.FromMinutes(5);
+
+            await Task.Delay(delay);
+        }
+
+
+        private async Task processItemsAsync(){
+            while(true){
+                var items = await this.getMoreItemsAsync();
+                this.availableSlots -= items.Count;
+
+                if(this.isDisposed){
+                    await Task.WhenAll(this.itemsInExecution);
+                    break;
                 }
-            };
 
-            waitForNextTurn = async() => {
-                var timestamp = await this.queueProvider.getNextItemTimestampAsync(this.queueName);
+                this.itemsInExecution.AddRange(items.Select(this.callback));
 
-                TimeSpan delay;
-                if(timestamp != null && timestamp.HasValue)
-                    delay = timestamp.Value.ToUniversalTime() - DateTime.Now.ToUniversalTime();
-                else
-                    delay = TimeSpan.FromMinutes(5);
+                var finished = await Task.WhenAny(this.itemsInExecution.ToArray());
 
-                await Task.Delay(delay);
-            };
-            
-            Task.Run(() => processItemStream());
+                this.itemsInExecution.Remove(finished);
+
+                this.availableSlots++;
+            }
         }
 
         public void Dispose(){
             if(this.isDisposed)
-                return;
+                throw new InvalidOperationException("Already disposed");
+
+            this.isDisposed = true;
         }
     }
 }
